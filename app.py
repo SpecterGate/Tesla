@@ -1,105 +1,149 @@
-import subprocess
-import requests
-from flask import Flask, Response, request, render_template_string, abort
-
-app = Flask(__name__)
-
-# --- CONFIGURATION ---
-SECRET_KEY = "tesla123" 
-# Public Invidious API instances to bypass YouTube 429 blocks
-INSTANCES = ["https://yewtu.be", "https://inv.vern.cc", "https://invidious.nerdvpn.de"]
-
-def get_stream_urls(video_id):
-    for instance in INSTANCES:
-        try:
-            data = requests.get(f"{instance}/api/v1/videos/{video_id}", timeout=5).json()
-            # Extract Video-only stream (360p is best for MJPEG stability)
-            v_url = next(f['url'] for f in data.get('formatStreams', []) if "360p" in f.get('qualityLabel', ''))
-            # Extract Audio-only stream
-            a_url = next(f['url'] for f in data.get('adaptiveFormats', []) if "audio" in f.get('type', ''))
-            return v_url, a_url
-        except: continue
-    return None, None
-
-@app.route('/v_stream/<v_id>')
-def video_stream(v_id):
-    if request.args.get('key') != SECRET_KEY: abort(403)
-    v_url, _ = get_stream_urls(v_id)
-    if not v_url: return ""
-    
-    # FFmpeg: Convert video to MJPEG (Image Stream) to bypass Tesla Video Lockout
-    cmd = [
-        'ffmpeg', '-re', '-i', v_url, 
-        '-vf', 'scale=854:480,fps=15', 
-        '-f', 'image2pipe', '-vcodec', 'mjpeg', '-q:v', '12', 'pipe:1'
-    ]
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    
-    def generate():
-        try:
-            while True:
-                frame = p.stdout.read(1024*64)
-                if not frame: break
-                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        finally:
-            p.kill()
-            
-    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-@app.route('/a_stream/<v_id>')
-def audio_stream(v_id):
-    if request.args.get('key') != SECRET_KEY: abort(403)
-    _, a_url = get_stream_urls(v_id)
-    if not a_url: return ""
-    
-    # FFmpeg: Pipe audio directly as AAC
-    cmd = ['ffmpeg', '-re', '-i', a_url, '-c:a', 'aac', '-b:a', '128k', '-f', 'adts', 'pipe:1']
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    return Response(p.stdout, mimetype='audio/aac')
-
-@app.route('/')
-def index():
-    if request.args.get('key') != SECRET_KEY:
-        return "Access Denied. Use ?key=tesla123", 403
-
-    return render_template_string("""
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Tesla YouTube</title>
+    <title>Tesla YouTube TV</title>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500&display=swap" rel="stylesheet">
     <style>
         :root {
-            --yt-black: #0f0f0f; --yt-red: #ff0000; --yt-white: #f1f1f1;
-            --nav-height: 85px; --glass: rgba(255, 255, 255, 0.07); --glass-border: rgba(255, 255, 255, 0.1);
+            --yt-black: #0f0f0f;
+            --yt-red: #ff0000;
+            --yt-white: #f1f1f1;
+            --nav-height: 85px;
+            --glass: rgba(255, 255, 255, 0.07);
+            --glass-border: rgba(255, 255, 255, 0.1);
         }
-        body { background-color: var(--yt-black); color: var(--yt-white); font-family: sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
-        main { flex: 1; display: flex; flex-direction: column; padding: 25px 40px; overflow-y: auto; background: radial-gradient(circle at top center, #1e1e1e 0%, #0f0f0f 100%); padding-bottom: calc(var(--nav-height) + 20px); }
-        .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
-        .logo-group { display: flex; align-items: center; gap: 10px; cursor: pointer; }
-        .yt-play-icon { width: 36px; height: 26px; background: var(--yt-red); border-radius: 7px; display: flex; align-items: center; justify-content: center; }
-        .yt-play-icon::after { content: ''; border-style: solid; border-width: 5px 0 5px 9px; border-color: transparent transparent transparent white; }
-        .yt-text { font-size: 22px; font-weight: 700; color: white; }
-        .search-pill { background: var(--glass); border: 1px solid var(--glass-border); padding: 12px 25px; border-radius: 40px; width: 380px; display: flex; align-items: center; }
-        .search-pill input { background: transparent; border: none; color: white; font-size: 18px; width: 100%; outline: none; margin-left: 12px; }
-        
-        /* Player Overlay */
-        #player-overlay { display: none; margin-bottom: 30px; text-align: center; background: #000; border-radius: 12px; padding: 10px; border: 1px solid var(--glass-border); }
-        #stream-img { width: 100%; max-width: 854px; border-radius: 8px; }
-        
-        .video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 24px; }
-        .tv-card { cursor: pointer; transition: 0.2s; }
-        .thumb-wrap { border-radius: 12px; overflow: hidden; aspect-ratio: 16/9; background: #222; }
-        .thumb-wrap img { width: 100%; height: 100%; object-fit: cover; }
-        .meta { margin-top: 12px; }
-        .meta h3 { font-size: 16px; margin: 0; color: #fff; }
-        .meta p { color: #aaa; font-size: 13px; }
 
-        nav.bottom-rail { position: fixed; bottom: 0; left: 0; right: 0; height: var(--nav-height); background: rgba(15, 15, 15, 0.98); display: flex; justify-content: center; align-items: center; gap: 90px; border-top: 1px solid var(--glass-border); }
-        .nav-item { display: flex; flex-direction: column; align-items: center; color: white; opacity: 0.6; cursor: pointer; }
+        body {
+            background-color: var(--yt-black);
+            color: var(--yt-white);
+            font-family: 'Roboto', sans-serif;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            padding: 25px 40px;
+            overflow-y: auto;
+            background: radial-gradient(circle at top center, #1e1e1e 0%, #0f0f0f 100%);
+            padding-bottom: calc(var(--nav-height) + 20px);
+        }
+
+        .header-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+        }
+
+        /* Fixed Logo SVG */
+        .logo-group svg {
+            height: 32px;
+            cursor: pointer;
+        }
+
+        .search-pill {
+            background: var(--glass);
+            border: 1px solid var(--glass-border);
+            padding: 12px 25px;
+            border-radius: 40px;
+            width: 380px;
+            display: flex;
+            align-items: center;
+            transition: all 0.2s ease;
+        }
+
+        .search-pill:focus-within {
+            border-color: #3ea6ff;
+            background: rgba(255,255,255,0.12);
+            width: 420px;
+        }
+
+        .search-pill input {
+            background: transparent;
+            border: none;
+            color: white;
+            font-size: 18px;
+            width: 100%;
+            outline: none;
+            margin-left: 12px;
+        }
+
+        nav.bottom-rail {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: var(--nav-height);
+            background: rgba(15, 15, 15, 0.98);
+            backdrop-filter: blur(25px);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 70px;
+            border-top: 1px solid var(--glass-border);
+            z-index: 1000;
+        }
+
+        .nav-item {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            cursor: pointer;
+            color: white;
+            opacity: 0.6;
+            transition: all 0.2s;
+            text-decoration: none;
+            min-width: 80px;
+        }
+
         .nav-item.active { opacity: 1; }
-        .nav-item svg { width: 24px; height: 24px; }
+        .nav-item svg { width: 26px; height: 26px; margin-bottom: 6px; }
+        .nav-item span { font-size: 12px; font-weight: 400; }
+
+        .video-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 24px;
+        }
+
+        .tv-card { cursor: pointer; transition: transform 0.2s cubic-bezier(0.33, 1, 0.68, 1); }
+        .tv-card:hover { transform: translateY(-5px); }
+
+        .thumb-wrap {
+            position: relative;
+            border-radius: 14px;
+            overflow: hidden;
+            aspect-ratio: 16/9;
+            background: #222;
+        }
+
+        .thumb-wrap img { width: 100%; height: 100%; object-fit: cover; }
+
+        .duration {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+            background: rgba(0,0,0,0.85);
+            padding: 4px 7px;
+            font-size: 12px;
+            font-weight: 500;
+            border-radius: 4px;
+        }
+
+        .meta { margin-top: 14px; display: flex; gap: 14px; }
+        .channel-art { width: 40px; height: 40px; border-radius: 50%; background: #333; flex-shrink: 0; overflow: hidden; }
+        .meta-text h3 { font-size: 17px; font-weight: 500; margin: 0 0 6px 0; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.4; color: #fff; }
+        .meta-text p { color: #aaa; font-size: 14px; margin: 0; }
+
+        #status-msg { width: 100%; text-align: center; padding: 40px; font-size: 18px; color: #888; }
     </style>
 </head>
 <body>
@@ -107,26 +151,24 @@ def index():
     <main>
         <div class="header-row">
             <div class="logo-group" onclick="location.reload()">
-                <div class="yt-play-icon"></div>
-                <div class="yt-text">YouTube</div>
+                <svg viewBox="0 0 100 24" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M23.5 4.6c-.3-1.1-1.1-1.9-2.2-2.2C19.3 2 12 2 12 2s-7.3 0-9.3.5C1.6 2.8.8 3.6.5 4.6 0 6.6 0 10.8 0 10.8s0 4.2.5 6.2c.3 1.1 1.1 1.9 2.2 2.2 2 1 9.3 1 9.3 1s7.3 0 9.3-.5c1.1-.3 1.9-1.1 2.2-2.2.5-2 .5-6.2.5-6.2s0-4.2-.5-6.2z" fill="#f00"/>
+                    <path d="M9.6 15.4l6.3-3.6-6.3-3.6v7.2z" fill="#fff"/>
+                    <path d="M32.5 17.5l-2.6-9.1h-2.1l-1.3 6.3c-.3 1.4-.6 2.8-.8 4.2h-.1c-.2-1.4-.5-2.8-.8-4.2l-1.4-6.3h-2.1l-2.6 9.1h1.9l.4-2.5c.2-1.1.4-2.2.6-3.4h.1c.2 1.2.4 2.3.6 3.4l.4 2.5h1.9l1.4-6.3c.3-1.4.6-2.8.8-4.2h.1c.2 1.4.5 2.8.8 4.2l1.4 6.3h1.9z" fill="#fff" transform="translate(10, 1) scale(0.8)"/>
+                </svg>
             </div>
             <div class="search-pill">
-                <input type="text" id="search-box" placeholder="Search">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="white"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"></path></svg>
+                <input type="text" id="search-box" placeholder="Search videos...">
             </div>
         </div>
 
-        <div id="player-overlay">
-            <img id="stream-img" src="">
-            <audio id="stream-audio" autoplay></audio>
-            <div style="margin-top:10px;"><button onclick="stopPlayer()" style="background:var(--glass); color:white; border:1px solid #444; padding:10px 20px; border-radius:20px; cursor:pointer;">Close Video</button></div>
-        </div>
-
-        <div id="status" style="text-align:center; padding:20px;">Loading...</div>
+        <div id="status-msg">Fetching the latest videos...</div>
         <div class="video-grid" id="video-grid"></div>
     </main>
 
     <nav class="bottom-rail">
-        <div class="nav-item active" onclick="location.reload()">
+        <div class="nav-item active">
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 10V21H9V15H15V21H20V10L12 3L4 10Z"></path></svg>
             <span>Home</span>
         </div>
@@ -135,61 +177,98 @@ def index():
             <span>Shorts</span>
         </div>
         <div class="nav-item">
-            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14.5v-9l6 4.5-6 4.5z"></path></svg>
-            <span>Library</span>
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M10 18V7L15 12.5L10 18ZM20 3H4V1H20V3ZM22 6H2V4H22V6ZM22 19V8H2V19H22ZM12 21H2V23H22V21H12Z"></path></svg>
+            <span>Subscriptions</span>
         </div>
     </nav>
 
     <script>
-        const API_KEY = "AIzaSyCmzrNRJa7YA5fhln-1gB9tq8Ac9HeaJoc";
-        const SECRET = "tesla123";
+        // Use a more reliable public instance list
+        const INSTANCES = [
+            "https://pipedapi.leptons.xyz", 
+            "https://api-piped.mha.fi",
+            "https://pipedapi.kavin.rocks"
+        ];
+        let currentInstanceIdx = 0;
 
         async function fetchVideos(query = "") {
-            const status = document.getElementById('status');
+            const status = document.getElementById('status-msg');
             status.style.display = "block";
-            let url = query ? `https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=15&q=${encodeURIComponent(query)}&type=video&key=${API_KEY}`
-                            : `https://www.googleapis.com/youtube/v3/videos?part=snippet&chart=mostPopular&regionCode=US&maxResults=15&key=${API_KEY}`;
+            status.innerText = "Loading...";
+
             try {
-                const res = await fetch(url);
-                const data = await res.json();
-                render(data.items, !!query);
+                const baseUrl = INSTANCES[currentInstanceIdx];
+                const endpoint = query 
+                    ? `${baseUrl}/search?q=${encodeURIComponent(query)}&filter=videos`
+                    : `${baseUrl}/trending?region=US`;
+
+                const response = await fetch(endpoint);
+                if (!response.ok) throw new Error("API Limit Reached");
+                
+                const data = await response.json();
+                renderVideos(query ? data.items : data);
                 status.style.display = "none";
-            } catch (e) { status.innerText = "Error: " + e.message; }
+            } catch (err) {
+                console.warn(`Instance ${INSTANCES[currentInstanceIdx]} failed, trying next...`);
+                if (currentInstanceIdx < INSTANCES.length - 1) {
+                    currentInstanceIdx++;
+                    fetchVideos(query);
+                } else {
+                    status.innerText = "All instances busy. Try again in a minute.";
+                }
+            }
         }
 
-        function playVideo(videoId) {
-            document.getElementById('player-overlay').style.display = "block";
-            document.getElementById('stream-img').src = `/v_stream/${videoId}?key=${SECRET}`;
-            document.getElementById('stream-audio').src = `/a_stream/${videoId}?key=${SECRET}`;
-            window.scrollTo({top: 0, behavior: 'smooth'});
-        }
-
-        function stopPlayer() {
-            document.getElementById('player-overlay').style.display = "none";
-            document.getElementById('stream-img').src = "";
-            document.getElementById('stream-audio').src = "";
-        }
-
-        function render(items, isSearch) {
+        function renderVideos(videos) {
             const grid = document.getElementById('video-grid');
             grid.innerHTML = '';
-            items.forEach(item => {
-                const videoId = isSearch ? item.id.videoId : item.id;
+            
+            if (!videos || videos.length === 0) {
+                document.getElementById('status-msg').innerText = "No videos found.";
+                document.getElementById('status-msg').style.display = "block";
+                return;
+            }
+
+            videos.forEach(v => {
                 const card = document.createElement('div');
                 card.className = 'tv-card';
-                card.onclick = () => playVideo(videoId);
-                card.innerHTML = `<div class="thumb-wrap"><img src="${item.snippet.thumbnails.high.url}"></div>
-                                  <div class="meta"><h3>${item.snippet.title}</h3><p>${item.snippet.channelTitle}</p></div>`;
+                // Direct YouTube link for reliability
+                const videoId = v.url.split('=')[1];
+                card.onclick = () => window.open(`https://www.youtube.com/watch?v=${videoId}`, '_blank');
+                
+                card.innerHTML = `
+                    <div class="thumb-wrap">
+                        <img src="${v.thumbnail}" onerror="this.src='https://images.unsplash.com/photo-1611162617474-5b21e879e113?auto=format&fit=crop&w=800&q=60'">
+                        <div class="duration">${v.duration > 0 ? formatTime(v.duration) : 'LIVE'}</div>
+                    </div>
+                    <div class="meta">
+                        <div class="channel-art"><img src="https://ui-avatars.com/api/?name=${encodeURIComponent(v.uploaderName)}&background=random" style="width:100%"></div>
+                        <div class="meta-text">
+                            <h3>${v.title}</h3>
+                            <p>${v.uploaderName} • ${v.shortViews || 'Live'}</p>
+                        </div>
+                    </div>
+                `;
                 grid.appendChild(card);
             });
         }
 
-        document.getElementById('search-box').onkeypress = (e) => { if(e.key === 'Enter') fetchVideos(e.target.value); };
+        function formatTime(s) {
+            if (isNaN(s)) return s;
+            const hrs = Math.floor(s / 3600);
+            const mins = Math.floor((s % 3600) / 60);
+            const secs = Math.floor(s % 60);
+            return (hrs > 0 ? hrs + ":" : "") + (mins < 10 && hrs > 0 ? "0" : "") + mins + ":" + (secs < 10 ? "0" : "") + secs;
+        }
+
+        document.getElementById('search-box').onkeypress = (e) => {
+            if(e.key === 'Enter') {
+                currentInstanceIdx = 0; // Reset to first instance for new search
+                fetchVideos(e.target.value);
+            }
+        };
+
         fetchVideos();
     </script>
 </body>
 </html>
-    """)
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
