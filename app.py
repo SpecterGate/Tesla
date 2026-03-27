@@ -1,4 +1,5 @@
 import subprocess
+import requests
 from flask import Flask, Response, request, render_template_string, abort
 
 app = Flask(__name__)
@@ -6,37 +7,44 @@ app = Flask(__name__)
 # --- CONFIGURATION ---
 SECRET_KEY = "tesla123" 
 TARGET_FPS = "15"
-RESOLUTION = "854:480" 
+RESOLUTION = "854:480" # Aiming for ~1GB per hour
 
-# List of Invidious instances to bypass YouTube's 429 block
-INVIDIOUS_INSTANCES = [
+# Public Invidious API instances to bypass 429 errors
+INSTANCES = [
     "https://yewtu.be",
-    "https://invidious.projectsegfau.lt",
     "https://invidious.nerdvpn.de",
-    "https://inv.vern.cc"
+    "https://inv.vern.cc",
+    "https://invidious.no-logs.com"
 ]
 
-def generate_frames(video_id):
-    raw_url = None
-    
-    # Try multiple bypass instances until one works
-    for instance in INVIDIOUS_INSTANCES:
-        cmd_url = [
-            "yt-dlp", "-g", 
-            "-f", "bestvideo[height<=480][ext=mp4]/best[height<=480]", 
-            f"{instance}/watch?v={video_id}"
-        ]
+def get_direct_url(video_id):
+    """Bypasses YouTube blocks by asking Invidious for the direct MP4 link."""
+    for instance in INSTANCES:
         try:
-            # We limit timeout so it doesn't hang the car browser
-            raw_url = subprocess.check_output(cmd_url, timeout=10).decode("utf-8").strip()
-            if raw_url: break 
+            api_url = f"{instance}/api/v1/videos/{video_id}"
+            data = requests.get(api_url, timeout=5).json()
+            
+            # Find the best 480p or 360p MP4 stream
+            formats = data.get('formatStreams', [])
+            for f in formats:
+                if "480p" in f.get('qualityLabel', '') or "360p" in f.get('qualityLabel', ''):
+                    return f['url']
+            
+            # Fallback to any adaptive format if direct MP4 isn't found
+            adaptive = data.get('adaptiveFormats', [])
+            for a in adaptive:
+                if "video" in a.get('type', '') and "480p" in a.get('qualityLabel', ''):
+                    return a['url']
         except:
             continue
+    return None
 
+def generate_frames(video_id):
+    raw_url = get_direct_url(video_id)
     if not raw_url:
-        return # All bypass attempts failed
+        return
 
-    # FFmpeg tuned for Intel Atom & 1GB/hr target
+    # FFmpeg tuned for Intel Atom (MCU2) stability
     ffmpeg_cmd = [
         'ffmpeg', '-re', '-i', raw_url, 
         '-vf', f'scale={RESOLUTION},fps={TARGET_FPS}', 
@@ -48,6 +56,7 @@ def generate_frames(video_id):
 
     try:
         while True:
+            # Buffer size optimized for 480p frames
             frame = process.stdout.read(1024*64) 
             if not frame: break
             yield (b'--frame\r\n'
@@ -72,10 +81,13 @@ def index():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Tesla YouTube Bypass</title>
+    <title>Tesla YouTube</title>
     <style>
-        :root { --yt-black: #0f0f0f; --yt-red: #ff0000; --yt-white: #f1f1f1; --nav-height: 85px; --glass: rgba(255, 255, 255, 0.07); --glass-border: rgba(255, 255, 255, 0.1); }
-        body { background-color: var(--yt-black); color: var(--yt-white); font-family: sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+        :root {
+            --yt-black: #0f0f0f; --yt-red: #ff0000; --yt-white: #f1f1f1;
+            --nav-height: 85px; --glass: rgba(255, 255, 255, 0.07); --glass-border: rgba(255, 255, 255, 0.1);
+        }
+        body { background-color: var(--yt-black); color: var(--yt-white); font-family: 'Roboto', sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
         main { flex: 1; display: flex; flex-direction: column; padding: 25px 40px; overflow-y: auto; background: radial-gradient(circle at top center, #1e1e1e 0%, #0f0f0f 100%); padding-bottom: calc(var(--nav-height) + 20px); }
         .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
         .logo-group { display: flex; align-items: center; gap: 10px; cursor: pointer; }
@@ -85,13 +97,13 @@ def index():
         .search-pill { background: var(--glass); border: 1px solid var(--glass-border); padding: 12px 25px; border-radius: 40px; width: 380px; display: flex; align-items: center; }
         .search-pill input { background: transparent; border: none; color: white; font-size: 18px; width: 100%; outline: none; margin-left: 12px; }
         #player-container { width: 100%; display: none; margin-bottom: 30px; text-align: center; }
-        #player-container img { width: 100%; max-width: 900px; border-radius: 12px; border: 1px solid #444; }
-        .video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 24px; }
-        .tv-card { cursor: pointer; }
+        #player-container img { width: 100%; max-width: 900px; border-radius: 12px; border: 1px solid var(--glass-border); }
+        .video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 24px; }
+        .tv-card { cursor: pointer; transition: 0.2s; }
         .thumb-wrap { border-radius: 12px; overflow: hidden; aspect-ratio: 16/9; background: #222; }
         .thumb-wrap img { width: 100%; height: 100%; object-fit: cover; }
         .meta { margin-top: 12px; }
-        #status { text-align: center; padding: 20px; color: #888; }
+        #status { text-align: center; padding: 20px; color: #888; font-size: 18px; }
         nav.bottom-rail { position: fixed; bottom: 0; left: 0; right: 0; height: var(--nav-height); background: rgba(15, 15, 15, 0.98); display: flex; justify-content: center; align-items: center; gap: 90px; border-top: 1px solid var(--glass-border); }
         .nav-item { display: flex; flex-direction: column; align-items: center; color: white; opacity: 0.6; cursor: pointer; }
         .nav-item.active { opacity: 1; }
@@ -103,7 +115,7 @@ def index():
             <div class="logo-group" onclick="location.reload()"><div class="yt-play-icon"></div><div class="yt-text">YouTube</div></div>
             <div class="search-pill"><input type="text" id="search-box" placeholder="Search"></div>
         </div>
-        <div id="player-container"><div id="video-wrapper"></div></div>
+        <div id="player-container"><div id="video-wrapper"></div><p id="sync-note" style="color:#666; font-size:12px; margin-top:10px;">Use Bluetooth for Audio</p></div>
         <div id="status">Loading...</div>
         <div class="video-grid" id="video-grid"></div>
     </main>
@@ -122,7 +134,7 @@ def index():
             const status = document.getElementById('status');
             status.style.display = "block";
             let url = query ? `https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=20&q=${encodeURIComponent(query)}&type=video&key=${API_KEY}`
-                            : `https://www.googleapis.com/youtube/v3/videos?part=snippet&chart=mostPopular&regionCode=US&maxResults=20&key=${API_KEY}`;
+                            : `https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics&chart=mostPopular&regionCode=US&maxResults=20&key=${API_KEY}`;
             try {
                 const res = await fetch(url);
                 const data = await res.json();
